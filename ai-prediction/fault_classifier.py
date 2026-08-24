@@ -25,6 +25,7 @@
 
 import argparse
 import json
+import sys
 
 
 def clip01(value: float) -> float:
@@ -413,8 +414,9 @@ def main():
     args = parser.parse_args()
     if args.library:
         print(json.dumps(FAULT_LIBRARY, ensure_ascii=False, indent=2))
-    else:
-        run_selftest()
+        return
+    # 自检失败以非零退出码上报, 便于脚本/CI 感知
+    sys.exit(0 if run_selftest() else 1)
 
 
 if __name__ == "__main__":
