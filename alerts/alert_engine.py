@@ -89,9 +89,10 @@ class AlertEngine:
 
     def _save(self):
         """告警与工单落盘, 供看板读取与断电恢复。"""
-        os.makedirs(ALERT_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(self.alerts_path) or ".", exist_ok=True)
         with open(self.alerts_path, "w", encoding="utf-8") as f:
             json.dump(self.alerts[-500:], f, ensure_ascii=False, indent=2)
+        os.makedirs(os.path.dirname(self.workorders_path) or ".", exist_ok=True)
         with open(self.workorders_path, "w", encoding="utf-8") as f:
             json.dump(self.workorders[-500:], f, ensure_ascii=False, indent=2)
 
@@ -275,8 +276,20 @@ class AlertEngine:
 # 内置自检: 模拟三档健康评分与 RUL 场景, 验证告警与工单联动
 # ------------------------------------------------------------------------------
 def run_selftest() -> bool:
-    """构造递进恶化的预测结果序列, 验证告警分级/抑制/工单生成。"""
-    engine = AlertEngine()
+    """构造递进恶化的预测结果序列, 验证告警分级/抑制/工单生成。
+
+    自检全程使用系统临时目录, 不读写真实告警库 data/alerts/,
+    避免测试告警/工单污染生产状态文件。
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="alert_selftest_") as tmp:
+        engine = AlertEngine(alerts_path=os.path.join(tmp, "alerts.json"),
+                             workorders_path=os.path.join(tmp, "workorders.json"))
+        return _run_selftest_scenarios(engine)
+
+
+def _run_selftest_scenarios(engine: AlertEngine) -> bool:
+    """在给定引擎实例上执行递进恶化场景自检(由 run_selftest 调用)。"""
     device = "MOTOR-001"
     scenarios = [
         # (健康评分, 振动z, 温度z, 电流z, 说明)
@@ -320,7 +333,8 @@ def main():
     parser = argparse.ArgumentParser(description="数字孪生平台 - 告警引擎")
     parser.add_argument("--selftest", action="store_true", help="运行内置场景自检")
     args = parser.parse_args()
-    run_selftest()
+    # 自检失败以非零退出码上报, 便于脚本/CI 感知
+    sys.exit(0 if run_selftest() else 1)
 
 
 if __name__ == "__main__":
