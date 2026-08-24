@@ -30,6 +30,7 @@ import math
 import os
 import random
 import time
+import zlib
 from datetime import datetime, timedelta
 
 # ------------------------------------------------------------------------------
@@ -259,7 +260,10 @@ class DataSimulator:
         self.rng = random.Random(seed)
         self.devices = {}
         for device_id, cfg in DEVICES.items():
-            sim = DeviceSimulator(device_id, cfg, random.Random(seed + hash(device_id) % 1000))
+            # 每台设备派生独立子种子; 用 zlib.crc32 做稳定哈希,
+            # 不能用内建 hash(): 字符串哈希每次进程启动随机加盐, 无法复现
+            sub_seed = seed + zlib.crc32(device_id.encode("utf-8")) % 1000
+            sim = DeviceSimulator(device_id, cfg, random.Random(sub_seed))
             # 为每台设备注册典型的故障注入计划(阈值即健康度越过点)
             plans = {
                 "bearing_wear": 0.60,       # 轴承磨损: 轻度衰退后期出现
