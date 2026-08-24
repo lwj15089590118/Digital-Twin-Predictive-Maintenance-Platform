@@ -540,7 +540,9 @@ function refreshDetailPanel(dev) {
       .then((data) => {
         const extra = document.getElementById('twin-detail-extra');
         if (!extra) return;
-        const rul = data.rul || {};
+        // /api/prediction/<id> 返回 {prediction, fault, twin}, 预测指标在 prediction 子对象里
+        const pred = data.prediction || {};
+        const rul = pred.rul || {};
         const rulText = rul.rul_hours !== null && rul.rul_hours !== undefined
           ? rul.rul_hours.toFixed(1) + ' 小时 (80%CI: ' + rul.rul_ci_low.toFixed(1) + ' ~ ' + rul.rul_ci_high.toFixed(1) + ')'
           : '暂不可估(' + (rul.trend || '数据不足') + ')';
@@ -549,7 +551,7 @@ function refreshDetailPanel(dev) {
           : '暂无显著故障特征';
         extra.innerHTML =
           '<div>剩余寿命 RUL: <b>' + rulText + '</b></div>' +
-          '<div>异常评分: ' + (data.anomaly_score !== undefined ? data.anomaly_score : '-') + ' / 100</div>' +
+          '<div>异常评分: ' + (pred.anomaly_score !== undefined ? pred.anomaly_score : '-') + ' / 100</div>' +
           '<div>疑似故障: ' + fault + '</div>' +
           (data.fault && !data.fault.ruled_out
             ? '<div style="margin-top:4px">处置建议: ' + data.fault.matched[0].actions[0] + '</div>'
