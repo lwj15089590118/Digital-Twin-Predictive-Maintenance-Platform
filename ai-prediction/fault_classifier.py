@@ -287,12 +287,20 @@ class FaultClassifier:
 
     @staticmethod
     def _evidence_strength(z: float, lo: float, hi: float) -> float:
-        """计算单通道证据强度(0~1), 分开口区间与有界区间两种情形。"""
-        if lo > 0 or (lo == 0 and hi >= 50):
+        """计算单通道证据强度(0~1), 按签名区间类型分三种情形。
+
+        区间类型以上下界是否为 ±50 以上的"无穷哨兵"判定:
+          - 上开口(lo>=0 且 hi>=50): 证据从 z=lo 起随偏离加深线性爬坡,
+            至 z=max(lo*2, lo+1) 达到满分;
+          - 下开口(hi<=-50): 从 z=hi 向下爬坡, 至 z=min(hi*2, hi-1) 满分;
+          - 有界区间(上下限均有限): 落入即满分, 超出无证据
+            (方向严重相反由 _contradicts 另行扣分)。
+        """
+        if lo >= 0 and hi >= 50:
             # 上开口: 证据从 z=lo 开始爬坡, 至 z=max(lo*2, lo+1) 达到满分
             full = max(lo * 2.0, lo + 1.0)
             return clip01((z - lo) / (full - lo))
-        if hi < 0 and lo <= -50:
+        if hi <= -50:
             # 下开口(如欠压): 从 z=hi 向下爬坡, 至 z=min(hi*2, hi-1) 满分
             full = min(hi * 2.0, hi - 1.0)
             return clip01((hi - z) / (hi - full))
