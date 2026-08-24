@@ -229,6 +229,21 @@ class TwinModel:
         if len(self.suggestions) > 50:
             self.suggestions = self.suggestions[-50:]
 
+    def reset(self):
+        """把孪生体复位到"出厂状态"(演示复位时调用)。
+
+        复位内容: 校准基线回到铭牌值、负载因子回 1.0、清空 EWMA 残差、
+        偏差历史与反向建议。若不复位, 演示复位后孪生仍带着上一轮寿命的
+        累计漂移, 同步度与模型健康估计会停留在低位, 与"全新设备"矛盾。
+        """
+        self.calibrated = copy.deepcopy(self.nominal)
+        self.load_factor = 1.0
+        self.last_update = None
+        self.residuals = []
+        self.ewma = {ch: 0.0 for ch in self.calibrated}
+        self.deviations = []
+        self.suggestions = []
+
     # ------------------------------------------------------------------
     # 导出: 供 AI 预测引擎与看板使用的数字孪生快照
     # ------------------------------------------------------------------
@@ -316,6 +331,12 @@ class TwinUpdater:
     def snapshots(self) -> dict:
         """导出全部孪生快照(看板 /api/twin 接口的数据源)。"""
         return {did: twin.snapshot() for did, twin in self.twins.items()}
+
+    def reset_all(self):
+        """全部孪生复位到出厂状态并落盘(演示复位时由看板调用)。"""
+        for twin in self.twins.values():
+            twin.reset()
+        self.save()
 
 
 def read_latest_records(stream_dir: str = STREAM_DIR) -> list:

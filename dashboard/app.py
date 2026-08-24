@@ -153,13 +153,17 @@ class Pipeline:
                        twin_summaries.get(rec["device_id"], {}))
 
     def reset(self):
-        """复位演示: 设备恢复全新状态, 清空评分历史与活动告警。"""
+        """复位演示: 设备恢复全新状态, 清空孪生漂移/评分历史/活动告警。"""
         self.simulator.reset_all()
+        self.twin.reset_all()                 # 孪生校准基线与偏差历史归零
         self.engine.health_history.clear()
         with store.lock:
+            store.realtime.clear()            # 旧生命周期的实时曲线一并清空
             store.health_hist.clear()
             store.predictions.clear()
             store.faults.clear()
+            store.twin_summary.clear()
+            store.pipeline_ticks = 0
         for a in self.alerts.alerts:
             a["status"] = "resolved"
         self.alerts._save()
