@@ -85,7 +85,21 @@ class AlertEngine:
                         setattr(self, attr, json.load(f))
                 except (json.JSONDecodeError, OSError):
                     setattr(self, attr, [])
-        self._counter = len(self.alerts) + len(self.workorders)
+        # 计数器取已加载记录的最大数字序号: _save 会把列表截断到最近 500 条,
+        # 若按条目数恢复计数器, 重启后新 ID 可能与被裁剪掉编号段之后的历史
+        # 记录重复, 破坏工单-告警关联与按 ID 关闭工单的准确性。
+        self._counter = self._max_existing_seq()
+
+    def _max_existing_seq(self) -> int:
+        """返回已加载告警/工单中最大的自增序号(无记录时为 0)。"""
+        mx = 0
+        for items in (self.alerts, self.workorders):
+            for item in items:
+                try:
+                    mx = max(mx, int(str(item.get("id", "")).rsplit("-", 1)[-1]))
+                except (ValueError, AttributeError, IndexError):
+                    continue
+        return mx
 
     def _save(self):
         """告警与工单落盘, 供看板读取与断电恢复。"""
