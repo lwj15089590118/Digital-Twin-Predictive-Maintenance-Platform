@@ -7,9 +7,11 @@
     1. 异常检测: 基于历史正常运行数据建立各传感器通道的基线分布,
        使用 IsolationForest(sklearn 可用时)或 Mahalanobis 距离(纯 numpy
        回退)识别实时数据中的异常模式;
-    2. 健康评分: 将多通道偏差加权融合为 0~100% 的设备健康评分;
+    2. 健康评分: 将多通道偏差加权融合为 0~100% 的设备健康评分,
+       并经真值校准的分段线性表映射, 使评分 ≈ 100×真实健康度;
     3. 剩余寿命预测 (RUL): 对近期健康评分序列拟合退化趋势线, 外推至
-       失效阈值, 换算剩余运行时长, 并基于拟合残差给出 80% 置信区间;
+       失效阈值, 换算剩余运行时长, 并基于拟合残差给出 80% 置信区间
+       (残差评分点量纲经标准外推方差放大后除以拟合斜率换算为小时);
     4. 劣化阶段分类: 使用随机森林(sklearn 可用时)或规则引擎(回退)判断
        设备当前所处生命周期阶段。
 
@@ -48,22 +50,37 @@ CHANNELS = ["vibration", "temperature", "current", "voltage", "rpm"]
 # 健康评分中各通道的权重(经验值: 振动是机械故障最灵敏的指示器)
 CHANNEL_WEIGHTS = {"vibration": 0.35, "temperature": 0.25,
                    "current": 0.20, "voltage": 0.10, "rpm": 0.10}
-# RUL 失效阈值: 健康评分低于该值认为功能性失效, 必须停机检修
+# RUL 失效阈值: 健康评分低于该值认为功能性失效, 必须停机检修。
+# 校准评分 ≈ 100×真值健康度, 故 35 分对应真值健康度约 0.35(严重退化区间)
 FAILURE_THRESHOLD = 35.0
+# RUL 输出上限(小时, 90 天): 退化早期斜率趋近于零, 微小的拟合斜率噪声
+# 会让线性外推产生无意义的巨额数值; 按行业惯例对 RUL 做上限截断
+# (如 C-MAPSS 基准将 RUL 截断至 125 循环), 超出运维规划视野的预测不再输出
+RUL_MAX_HOURS = 2160.0
 # 每个采样 tick 对应的真实运行时长(小时), 与数据模拟器保持一致
 TICK_HOURS = 10.0 / 60.0
-# 参与 RUL 拟合的近期窗口大小(条)
-RUL_WINDOW = 40
+# 参与 RUL 拟合的近期窗口大小(条)。取 144 = 一整天(温度日周期正弦的
+# 完整周期, 见 data_simulator.py 环境波动项): 窗口覆盖完整周期后, 日周期
+# 在斜率估计中正负抵消——v1.0 的 40 点窗口内日周期伪斜率与真实退化斜率
+# 同量级, 是黄金窗口 RUL 大量"不可估"的主因(2026-08 修复审查报告 07)
+RUL_WINDOW = 144
 
 
 # ------------------------------------------------------------------------------
 # 历史数据加载(csv 模块实现, 不依赖 pandas)
 # ------------------------------------------------------------------------------
 def load_history(csv_path: str) -> list:
-    """读取历史数据集 CSV 为记录列表(每条为 dict, 数值字段已转 float)。"""
+    """读取历史数据集 CSV 为记录列表(每条为 dict, 数值字段已转 float)。
+
+    缺失必需数值列时直接报错——静默置 0 会训练出垃圾基线且难以排查。
+    """
     records = []
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        missing = [ch for ch in CHANNELS if ch not in (reader.fieldnames or [])]
+        if missing:
+            raise ValueError("历史数据集 %s 缺少必需数值列: %s"
+                             % (csv_path, ", ".join(missing)))
         for row in reader:
             rec = {"timestamp": row.get("timestamp", ""),
                    "device_id": row.get("device_id", ""),
@@ -166,15 +183,44 @@ class AnomalyDetector:
 # 健康评分模型: 多通道加权融合
 # ------------------------------------------------------------------------------
 class HealthScorer:
-    """将实时记录转化为 0~100% 健康评分。
+    """将实时记录转化为 0~100% 健康评分(经真值校准)。
 
     评分逻辑: 对每个通道计算"恶化度"(0~1, 方向感知: 振动/温度/电流
-    单边上升恶化, 电压/转速双边偏离恶化), 按通道权重加权求和后映射
-    到 100*(1-deterioration)。
+    单边上升恶化, 电压/转速双边偏离恶化), 按通道权重加权求和得到
+    原始分, 再经保序回归校准表映射为校准评分。
+
+    校准说明(2026-08 修复审查报告 07-P1-2):
+        v1.0 版本单边通道 z>1σ 起算、每 6σ 记满, 在真值健康度 0.6~0.8
+        的"预测性维护黄金窗口"存在死区(实测 40% 样本被误判 normal、
+        35% 样本 RUL 不可估)。本次修复分两步:
+        1) 去死区: 单边通道 z>0.5σ 起算, 且按通道灵敏度分配满量程跨度
+           (振动 42σ/温度与电流 20σ, 双边通道 0.8σ 起算、8σ 记满)——
+           跨度过小会让振动(基线 σ 极小、z 爆炸式增长)过早饱和,
+           过大会淹没温度/电流的有效信号, 常数经真值上网格搜索确定;
+        2) 标度校准: 原始分对真值健康度单调但非线性, 经保序回归
+           (isotonic, 分段线性表)映射为校准评分, 使 score ≈ 100×真值
+           健康度。映射常数与校准表均在模拟器真值上离线标定——等价于
+           工业现场用失效数据离线标定评分模型, 运行时推理不读取真值
+           health 字段。校准效果见 reports/evaluation_report.md 第 2 节。
     """
 
     # 单边恶化通道(只有超过基线才算恶化): 振动/温度/电流
     ONE_SIDED = {"vibration", "temperature", "current"}
+    # 原始恶化度映射常数(离线校准, 方法见类文档字符串)
+    Z0_ONE_SIDED = 0.5                          # 单边通道起算阈值(σ)
+    SPAN_ONE_SIDED = {"vibration": 42.0,        # 振动: 满量程跨度(σ)
+                      "temperature": 20.0, "current": 20.0}
+    Z0_TWO_SIDED = 0.8                          # 双边通道起算阈值(|z|)
+    SPAN_TWO_SIDED = 8.0                        # 双边通道满量程跨度(σ)
+    # 保序回归校准表(原始分 -> 校准分), 分段线性插值; 两端越界即截断。
+    # 在 4 条独立仿真轨迹(seed=2026/11/22/33, 共约 1.9 万样本)上池化标定,
+    # 避免单条轨迹的工况噪声过拟合; 留出种子(7/44/55)验证中位偏差 ~4 分
+    SCORE_CALIBRATION = [
+        (0.0, 0.0), (30.0, 0.8), (34.7, 5.9), (41.0, 13.2), (47.4, 21.5),
+        (56.6, 32.0), (66.1, 41.1), (76.2, 50.3), (86.0, 59.2), (91.8, 66.8),
+        (94.8, 73.9), (96.7, 82.6), (97.9, 87.4), (98.6, 91.2), (99.2, 92.5),
+        (99.7, 93.7), (100.0, 94.9),
+    ]
 
     def __init__(self, baseline: BaselineProfile):
         self.baseline = baseline
@@ -183,16 +229,25 @@ class HealthScorer:
         """计算单通道恶化度: 0=完全健康, 1=严重恶化。"""
         z = self.baseline.z_scores(record)[ch]
         if ch in self.ONE_SIDED:
-            # 单边: z<=1 视为健康; z 每 +3 sigma 恶化度 +0.5
-            return float(np.clip((z - 1.0) / 6.0, 0.0, 1.0))
+            # 单边: z>0.5σ 起算(去死区), 各通道满量程跨度经真值校准
+            span = self.SPAN_ONE_SIDED[ch]
+            return float(np.clip((z - self.Z0_ONE_SIDED) / span, 0.0, 1.0))
         # 双边通道(电压/转速): |z| 偏离即恶化
-        return float(np.clip((abs(z) - 2.0) / 6.0, 0.0, 1.0))
+        return float(np.clip((abs(z) - self.Z0_TWO_SIDED) / self.SPAN_TWO_SIDED,
+                             0.0, 1.0))
+
+    @staticmethod
+    def calibrate(raw_score: float) -> float:
+        """保序回归分段线性校准: 原始分 -> 校准分(≈100×真值健康度)。"""
+        knots = HealthScorer.SCORE_CALIBRATION
+        return float(np.interp(raw_score, [k[0] for k in knots],
+                               [k[1] for k in knots]))
 
     def score(self, record: dict) -> float:
         """加权健康评分(0~100, 保留 1 位小数)。"""
         det = sum(CHANNEL_WEIGHTS[ch] * self.channel_deterioration(ch, record)
                   for ch in CHANNELS)
-        return round(100.0 * (1.0 - det), 1)
+        return round(self.calibrate(100.0 * (1.0 - det)), 1)
 
 
 # ------------------------------------------------------------------------------
@@ -205,8 +260,11 @@ class RULPredictor:
         1. 取最近 RUL_WINDOW 条健康评分序列;
         2. 最小二乘拟合一次退化趋势(每日下降速率), 可选检测加速退化;
         3. 外推至失效阈值 FAILURE_THRESHOLD 得 RUL(小时);
-        4. 用拟合残差的标准差构造 80% 置信区间
-           (正态近似: 均值 ± 1.2816 * sigma_residual * sqrt(外推步数比))。
+        4. 用拟合残差的标准差构造 80% 置信区间: 残差属"评分点"量纲,
+           先按线性外推预测方差放大
+           margin_score = 1.2816·σ·sqrt(1 + 1/n + (k-x̄)²/Sxx)
+           (k 为外推步数, 1.2816 为标准正态 80% 分位点), 再除以拟合
+           斜率绝对值 |b| 换算为时间量纲(小时)。
     """
 
     def predict(self, health_series: list) -> dict:
@@ -246,16 +304,29 @@ class RULPredictor:
                     "decline_per_day": round(decline_per_day, 2),
                     "trend": "failed", "method": "trend_extrapolation"}
         if b >= 0:
-            # 评分未下降: 无法外推, 返回保守的大值并标记
+            # 评分未下降: 趋势不足, 不强行外推(返回 None 并标注), 避免虚假承诺
             return {"rul_hours": None, "rul_ci_low": None, "rul_ci_high": None,
                     "decline_per_day": round(decline_per_day, 2), "trend": trend,
                     "method": "trend_extrapolation"}
         ticks_to_fail = (current - FAILURE_THRESHOLD) / (-b)
         rul_hours = ticks_to_fail * TICK_HOURS
-        # 80% 置信区间: 残差不确定性随外推距离放大(比例误差模型)
-        margin = 1.2816 * max(sigma, 0.5) * math.sqrt(max(ticks_to_fail, 1.0))
-        ci_low = max(0.0, rul_hours - margin * TICK_HOURS)
-        ci_high = rul_hours + margin * TICK_HOURS
+        # 80% 置信区间(2026-08 修复审查报告 07-P1-1 的量纲错误):
+        # 残差 sigma 是"评分点"量纲, 须先按线性外推预测方差放大到失效
+        # 时刻(k = ticks_to_fail), 再除以拟合斜率绝对值 |b|(评分点/tick)
+        # 换算为 tick, 最后乘 TICK_HOURS 得小时。v1.0 直接 margin×TICK_HOURS
+        # 得到"评分点×小时/tick", |b| 越小(慢退化, 恰是 RUL 最有价值的
+        # 早期)CI 被压得越窄。
+        x_bar = (n - 1) / 2.0
+        sxx = float(np.sum((x - x_bar) ** 2))
+        inflation = math.sqrt(1.0 + 1.0 / n
+                              + (max(ticks_to_fail, 0.0) - x_bar) ** 2
+                              / max(sxx, 1e-9))
+        margin_score = 1.2816 * max(sigma, 0.5) * inflation
+        margin_hours = margin_score / max(abs(b), 1e-9) * TICK_HOURS
+        # 上限截断: RUL 与置信区间一致截断到运维规划视野内
+        ci_low = max(0.0, rul_hours - margin_hours)
+        ci_high = min(RUL_MAX_HOURS, rul_hours + margin_hours)
+        rul_hours = min(RUL_MAX_HOURS, rul_hours)
         return {"rul_hours": round(rul_hours, 1),
                 "rul_ci_low": round(ci_low, 1),
                 "rul_ci_high": round(ci_high, 1),
@@ -291,10 +362,11 @@ class StageClassifier:
             x = np.array([[record[ch] for ch in CHANNELS]], dtype=float)
             code = int(self.model.predict(x)[0])
             return {1: "normal", 2: "warning", 3: "fault"}[code]
-        # 规则回退: 直接以健康评分阈值划分
+        # 规则回退: 直接以健康评分阈值划分。校准评分 ≈ 100×真值健康度,
+        # 阈值 80/60 与模拟器标签边界(normal>0.8, warning>0.6)对齐
         if health_score > 80.0:
             return "normal"
-        return "warning" if health_score > 50.0 else "fault"
+        return "warning" if health_score > 60.0 else "fault"
 
 
 # ------------------------------------------------------------------------------
