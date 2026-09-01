@@ -70,7 +70,7 @@ flowchart LR
 | 健康评分 | 振动/温度/电流/电压/转速五通道加权融合，输出 0~100% |
 | RUL 预测 | 健康评分退化趋势外推 + 拟合残差构造 80% 置信区间 |
 | 故障诊断 | 8 类故障知识库签名匹配，输出置信度、处置方案与备件清单 |
-| 告警工单 | 提醒/严重/紧急三级告警 + RUL 预测预警，自动生成工单并关联方案 |
+| 告警工单 | 提醒/严重/紧急三级告警 + RUL 预测预警，严重/紧急级别自动生成工单并关联方案 |
 | 3D 可视化 | Three.js 数字车间，设备颜色随健康评分绿→黄→橙→红渐变，点击查看详情 |
 | 综合看板 | 实时曲线、健康趋势、设备总览、告警列表、预测报告（Markdown）一键导出 |
 
@@ -86,7 +86,9 @@ Digital-Twin-Predictive-Maintenance-Platform/
 │   └── model_updater.py             # 数字孪生模型更新器(双向映射/偏差记录)
 ├── ai-prediction/
 │   ├── predictive_engine.py         # AI预测引擎(异常检测/健康评分/RUL)
-│   └── fault_classifier.py          # 故障分类器(8类故障知识库)
+│   ├── fault_classifier.py          # 故障分类器(8类故障知识库)
+│   └── evaluate.py                  # 定量评估(混淆矩阵/RUL误差/CI覆盖率)
+├── reports/                         # 评估工件(evaluation_report.md / .json)
 ├── visualization/
 │   └── 3d_scene/app.js              # Three.js 3D数字车间
 ├── dashboard/
@@ -104,7 +106,8 @@ Digital-Twin-Predictive-Maintenance-Platform/
 
 ### 环境要求
 
-- Python 3.10+，依赖：`flask`、`numpy`（必需）；`scikit-learn`（可选，缺失时自动降级为纯统计实现）
+- Python 3.10+，依赖见 [`requirements.txt`](requirements.txt)：`flask`、`numpy`（必需）；`scikit-learn`（可选，缺失时自动降级为纯统计实现）
+- 一键安装：`pip install -r requirements.txt`（如需启用 IsolationForest/随机森林，再安装 `scikit-learn`）
 - 现代浏览器（3D 场景需要 WebGL 支持，Three.js 与 Chart.js 通过 CDN 加载，首次打开需联网）
 
 ### 一键启动（推荐）
@@ -130,10 +133,14 @@ python ai-prediction/predictive_engine.py --train
 python ai-prediction/fault_classifier.py --selftest
 python alerts/alert_engine.py --selftest
 
-# 4. 数字孪生单步演示(快进900循环, 观察偏差演化)
+# 4. AI 基线定量评估(混淆矩阵/RUL 误差/CI 覆盖率, 工件写入 reports/)
+python ai-prediction/evaluate.py
+python ai-prediction/evaluate.py --selftest   # RUL 置信区间单元用例(快/慢退化)
+
+# 5. 数字孪生单步演示(快进900循环, 观察偏差演化)
 python digital-twin/model_updater.py --once
 
-# 5. 实时数据流模式(供孪生跟随消费)
+# 6. 实时数据流模式(供孪生跟随消费)
 python data-ingestion/data_simulator.py --mode stream --interval 1
 python digital-twin/model_updater.py --follow
 ```
@@ -143,6 +150,20 @@ python digital-twin/model_updater.py --follow
 1. **零依赖降级**：所有 AI 组件在 sklearn 缺失时自动切换到 numpy 统计实现（Mahalanobis 异常检测、规则阶段分类、最小二乘趋势外推），保证演示环境开箱即用；
 2. **规则 + 数据双引擎诊断**：故障知识库的物理签名匹配提供可解释归因，随机森林提供统计判别，两者互补；
 3. **数字孪生可解释同步**：每次同步输出通道级"实测 vs 模型"残差与同步度评分，偏差即早期故障特征来源；
-4. **预测驱动工单**：RUL 低于 72 小时或健康评分跌破阈值时自动生成工单，处置方案与备件清单直接来自故障库，形成管理闭环。
+4. **预测驱动告警**：RUL 低于 72 小时或健康评分跌破阈值时触发分级告警，其中健康评分跌破严重/紧急阈值时自动生成工单（RUL 预测预警仅提示、不生成工单），处置方案与备件清单直接来自故障库，形成管理闭环。
 
 更多架构细节、算法选型论证（LSTM vs 随机森林）与真实产线集成方案，请阅读 [`docs/系统设计说明书.md`](docs/系统设计说明书.md)。
+
+## 七、AI 基线定量评估
+
+本项目是规则/统计基线（健康评分 + 阶段分类 + RUL 趋势外推），未训练深度模型；评估脚本 [`ai-prediction/evaluate.py`](ai-prediction/evaluate.py) 在与训练集（seed 2026）无样本重叠的独立仿真轨迹（seed 7，三台设备全生命周期 4695 样本）上做留出评估，工件提交于 [`reports/evaluation_report.md`](reports/evaluation_report.md)。核心实测数字（numpy-fallback 后端）：
+
+| 指标 | 实测值 |
+| --- | --- |
+| 阶段分类准确率 / 宏 F1 | 92.3% / 0.890 |
+| 黄金窗口（真值健康度 0.6~0.8）漏检率 | 25.8%（修复前死区设计为 40.3%） |
+| 黄金窗口 RUL 不可估占比 | 9.8%（修复前 35.1%） |
+| RUL 中位相对误差 / MAE | 81.9% / 362.3 h |
+| 80% 置信区间实测覆盖率 | 24.5%（残差自相关使独立性假设低估长程不确定性，如实报告） |
+
+> 局限声明：特征与标签同源于自仿真数据（同一健康度真值同时决定传感器读数与标签），以上指标系统性偏高，仅用于回归对比与缺陷验证，不代表真实产线精度。复现方式见评估报告第 4 节。
