@@ -164,9 +164,9 @@ class Pipeline:
             store.faults.clear()
             store.twin_summary.clear()
             store.pipeline_ticks = 0
-        for a in self.alerts.alerts:
-            a["status"] = "resolved"
-        self.alerts._save()
+        # 告警复位走 AlertEngine.resolve_all(): 持锁改状态并落盘,
+        # 避免与流水线线程的 evaluate() 竞态(审查报告 07-P1-4)
+        self.alerts.resolve_all()
         print("[看板] 演示已复位为全新设备。")
 
 

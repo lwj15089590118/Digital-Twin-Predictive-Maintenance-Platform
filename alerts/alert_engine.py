@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 from datetime import datetime
 
 # 引入同项目的故障分类器(知识库), 用于告警自动关联处理方案
@@ -72,6 +73,12 @@ class AlertEngine:
         self.alerts = []          # 活动告警列表
         self.workorders = []      # 工单列表
         self._counter = 0
+        # 跨线程互斥锁(2026-08 修复审查报告 07-P1-4): 流水线线程调用
+        # evaluate(), Flask 线程并发调用 close_workorder()/查询接口/
+        # 复位路径, 无锁时 json.dump 遍历列表期间被并发 append 会抛
+        # RuntimeError 或写出交错文件。用 RLock 允许 evaluate() 持锁
+        # 期间内部再调用 _save()。
+        self.lock = threading.RLock()
         self._load()
 
     # ---------------------------- 持久化 ----------------------------
@@ -101,14 +108,25 @@ class AlertEngine:
                     continue
         return mx
 
+    @staticmethod
+    def _atomic_dump(path: str, data) -> None:
+        """原子写 JSON: 先写同目录临时文件, 再 os.replace 原子替换。
+
+        直接 open(path, "w") 在写入途中被并发读取/进程中断会留下半截
+        文件, 下次启动 json.load 失败; os.replace 在同一文件系统上原子生效。
+        """
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+
     def _save(self):
-        """告警与工单落盘, 供看板读取与断电恢复。"""
-        os.makedirs(os.path.dirname(self.alerts_path) or ".", exist_ok=True)
-        with open(self.alerts_path, "w", encoding="utf-8") as f:
-            json.dump(self.alerts[-500:], f, ensure_ascii=False, indent=2)
-        os.makedirs(os.path.dirname(self.workorders_path) or ".", exist_ok=True)
-        with open(self.workorders_path, "w", encoding="utf-8") as f:
-            json.dump(self.workorders[-500:], f, ensure_ascii=False, indent=2)
+        """告警与工单落盘, 供看板读取与断电恢复(持锁 + 原子替换)。"""
+        with self.lock:
+            # 写文件前截断到最近 500 条, 防止演示环境磁盘膨胀
+            self._atomic_dump(self.alerts_path, self.alerts[-500:])
+            self._atomic_dump(self.workorders_path, self.workorders[-500:])
 
     def _next_id(self, prefix: str) -> str:
         """生成自增编号: ALT-0001 / WO-0001 ..."""
@@ -134,23 +152,25 @@ class AlertEngine:
         now = datetime.now().isoformat(timespec="seconds")
         fired = []
 
-        # ---- 规则一: 健康评分分级告警 ----
-        for threshold, severity in HEALTH_THRESHOLDS:
-            if health < threshold:
-                alert = self._fire_health_alert(did, severity, threshold,
-                                                health, rul_hours, z_scores, now)
+        # 全程持锁: 与 Flask 线程的 close_workorder()/查询/复位互斥
+        with self.lock:
+            # ---- 规则一: 健康评分分级告警 ----
+            for threshold, severity in HEALTH_THRESHOLDS:
+                if health < threshold:
+                    alert = self._fire_health_alert(did, severity, threshold,
+                                                    health, rul_hours, z_scores, now)
+                    if alert:
+                        fired.append(alert)
+                    break                   # 只取满足的最高级别
+
+            # ---- 规则二: RUL 预测预警(即便健康评分尚可) ----
+            if rul_hours is not None and rul_hours < RUL_ALERT_HOURS and health >= 75.0:
+                alert = self._fire_predictive_alert(did, rul, health, z_scores, now)
                 if alert:
                     fired.append(alert)
-                break                       # 只取满足的最高级别
 
-        # ---- 规则二: RUL 预测预警(即便健康评分尚可) ----
-        if rul_hours is not None and rul_hours < RUL_ALERT_HOURS and health >= 75.0:
-            alert = self._fire_predictive_alert(did, rul, health, z_scores, now)
-            if alert:
-                fired.append(alert)
-
-        if fired:
-            self._save()
+            if fired:
+                self._save()
         return fired
 
     def _suppressed(self, device_id: str, severity: str) -> bool:
@@ -259,31 +279,46 @@ class AlertEngine:
 
     # ---------------------------- 查询接口 ----------------------------
     def active_alerts(self, device_id: str = None) -> list:
-        """查询活动告警(可按设备过滤), 按时间倒序。"""
-        items = [a for a in self.alerts if a["status"] == "active"]
+        """查询活动告警(可按设备过滤), 按时间倒序(持锁取快照)。"""
+        with self.lock:
+            items = [a for a in self.alerts if a["status"] == "active"]
         if device_id:
             items = [a for a in items if a["device_id"] == device_id]
         return sorted(items, key=lambda a: a["ts"], reverse=True)
 
     def open_workorders(self, device_id: str = None) -> list:
-        """查询未关闭工单(可按设备过滤)。"""
-        items = [w for w in self.workorders if w["status"] != "closed"]
+        """查询未关闭工单(可按设备过滤, 持锁取快照)。"""
+        with self.lock:
+            items = [w for w in self.workorders if w["status"] != "closed"]
         if device_id:
             items = [w for w in items if w["device_id"] == device_id]
         return items
 
     def close_workorder(self, workorder_id: str) -> bool:
         """关闭工单(维修完成), 同时关闭其来源告警。"""
-        for w in self.workorders:
-            if w["id"] == workorder_id:
-                w["status"] = "closed"
-                w["closed"] = datetime.now().isoformat(timespec="seconds")
-                for a in self.alerts:
-                    if a.get("workorder_id") == workorder_id:
-                        a["status"] = "resolved"
-                self._save()
-                return True
-        return False
+        with self.lock:
+            for w in self.workorders:
+                if w["id"] == workorder_id:
+                    w["status"] = "closed"
+                    w["closed"] = datetime.now().isoformat(timespec="seconds")
+                    for a in self.alerts:
+                        if a.get("workorder_id") == workorder_id:
+                            a["status"] = "resolved"
+                    self._save()
+                    return True
+            return False
+
+    def resolve_all(self) -> None:
+        """把全部活动告警置为 resolved 并落盘(演示复位时由看板调用)。
+
+        v1.0 中看板复位直接跨线程改 self.alerts 并调 _save(), 与流水线
+        线程的 evaluate() 竞态; 现在收敛为本方法统一持锁处理。
+        """
+        with self.lock:
+            for a in self.alerts:
+                if a["status"] == "active":
+                    a["status"] = "resolved"
+            self._save()
 
 
 # ------------------------------------------------------------------------------
