@@ -15,6 +15,14 @@
     - RUL 真值口径: 主口径为"真值健康度首次跌破失效阈值 35 分对应健康度
       (0.35)的剩余时长", 与 RULPredictor 外推目标的语义一致; 另附"至寿命
       终点(健康度=0)"口径作参考;
+    - RUL 量纲契约(v1.2 修正): 真值 RUL 与预测 RUL/置信区间统一为小时——
+      真值按 tick 差值 × TICK_HOURS(1 tick = 10 分钟)换算, 唯一换算点在
+      truth_rul_hours(); 此前真值滞留 tick 量纲与 rul_hours 直接比较,
+      使全部 RUL 定量指标失真(复审报告 07-N-P0-1);
+    - 与在线口径的差异: 本评估逐循环喂入(1 条记录 = 1 tick), 与
+      RULPredictor 的"每条 = 10 分钟"假设一致; 看板流水线为演示节奏,
+      每 6 个模拟循环仅把最后 1 条喂给引擎, 其在线 RUL 与本评估存在
+      约 3 倍的系统性口径差, 属已知待统一项(复审报告 07-P1);
     - 局限声明: 特征与标签同源于自仿真数据(同一健康度决定传感器读数与
       标签), 任何在此数据上的指标都系统性偏高, 不能外推到真实产线精度。
 
@@ -49,6 +57,18 @@ STAGES = ("normal", "warning", "fault")
 DEFAULT_OUT_DIR = os.path.join(PROJECT_ROOT, "reports")
 
 
+def truth_rul_hours(cycle: float, end_cycle: float) -> float:
+    """真值 RUL 换算(量纲契约): tick 差值 × TICK_HOURS 统一为小时。
+
+    evaluate.py 内所有真值 RUL(vs 失效阈值 / vs 寿命终点)的唯一 tick→
+    小时换算点, 保证与 RULPredictor 输出的 rul_hours / rul_ci_low /
+    rul_ci_high(小时)同量纲直接比较; --selftest 含该契约的单元断言。
+    v1.0 曾把 tick 差值直接当小时与 rul_hours 比较, 全部 RUL 指标失真
+    (复审报告 07-N-P0-1)。
+    """
+    return max(0.0, float(end_cycle) - float(cycle)) * TICK_HOURS
+
+
 # ------------------------------------------------------------------------------
 # 评估数据采集: 留出轨迹上逐循环推理
 # ------------------------------------------------------------------------------
@@ -57,6 +77,8 @@ def run_trajectories(seed: int, csv_path: str) -> tuple:
 
     每条记录: {device_id, cycle, truth_h, truth_label, health_score,
                stage, rul(estimable/None), rul_hours, ci_low, ci_high}
+    量纲契约: truth_rul_thr / truth_rul_eol 均为小时(truth_rul_hours 换算),
+    与 rul_hours / ci_low / ci_high 同量纲。
     """
     engine = PredictiveEngine()
     summary = engine.train(csv_path)
@@ -87,13 +109,14 @@ def run_trajectories(seed: int, csv_path: str) -> tuple:
                 "rul_hours": rul.get("rul_hours"),
                 "ci_low": rul.get("rul_ci_low"),
                 "ci_high": rul.get("rul_ci_high"),
-                "truth_rul_eol": max(0, DEVICES[did]["life_cycles"] - cycle),
+                "truth_rul_eol": truth_rul_hours(cycle, DEVICES[did]["life_cycles"]),
             })
     # 真值 RUL(至失效阈值)需在轨迹结束后回填: 失效循环在时序推进中才确定,
-    # 早期样本创建时无法预知(流式语义下的经典陷阱)
+    # 早期样本创建时无法预知(流式语义下的经典陷阱); 回填时经 truth_rul_hours
+    # 统一换算为小时(复审报告 07-N-P0-1 的量纲修正点)
     for s in samples:
         did = s["device_id"]
-        s["truth_rul_thr"] = (max(0, fail_cycle[did] - s["cycle"])
+        s["truth_rul_thr"] = (truth_rul_hours(s["cycle"], fail_cycle[did])
                               if did in fail_cycle else None)
     return samples, engine.backend
 
@@ -166,19 +189,22 @@ def rul_stats(samples: list) -> dict:
     def collect(key):
         rel, rel_near, abs_near, abs_h, covered, widths = [], [], [], [], 0, []
         n_ci = 0
-        zero_tail_ticks = 0
+        zero_tail_hours = 0.0
+        over_ratio = 0.0
         for s in samples:
-            truth = s[key]
+            truth = s[key]                     # 真值 RUL, 已统一为小时(量纲契约)
             if s["rul_hours"] is None or not truth:
                 continue
             err = abs(s["rul_hours"] - truth)
             rel.append(err / truth)
             abs_h.append(err)
+            if s["rul_hours"] > truth:
+                over_ratio = max(over_ratio, s["rul_hours"] / truth)
             if truth <= near_failure_hours:
                 rel_near.append(err / truth)
                 abs_near.append(err)
             if s["rul_hours"] == 0.0:
-                zero_tail_ticks = max(zero_tail_ticks, truth)
+                zero_tail_hours = max(zero_tail_hours, truth)
             if s["ci_low"] is not None:
                 n_ci += 1
                 widths.append(s["ci_high"] - s["rul_hours"])
@@ -194,6 +220,7 @@ def rul_stats(samples: list) -> dict:
             "median_rel_err_pct": round(100.0 * rel[n // 2], 1) if n else None,
             "mean_rel_err_pct": (round(100.0 * sum(rel) / n, 1) if n else None),
             "p90_rel_err_pct": (round(100.0 * rel[int(0.9 * n)], 1) if n else None),
+            "max_overestimate_ratio": round(over_ratio, 1) if n else None,
             "mae_hours": round(sum(abs_h) / n, 1) if n else None,
             "median_abs_err_hours": round(abs_h[n // 2], 1) if n else None,
             "near_failure_median_rel_err_pct": (round(100.0 * rel_near[len(rel_near) // 2], 1)
@@ -201,7 +228,7 @@ def rul_stats(samples: list) -> dict:
             "near_failure_median_abs_err_hours": (round(abs_near[len(abs_near) // 2], 1)
                                                   if abs_near else None),
             "near_failure_n": len(rel_near),
-            "zero_output_max_truth_hours": round(zero_tail_ticks * TICK_HOURS, 1),
+            "zero_output_max_truth_hours": round(zero_tail_hours, 1),
             "ci_n": n_ci,
             "ci_coverage_pct": round(100.0 * covered / n_ci, 1) if n_ci else None,
             "ci_median_half_width_hours": (round(sorted(widths)[n_ci // 2], 1)
@@ -254,6 +281,10 @@ def render_report(metrics: dict, seed: int, csv_path: str, backend: str) -> str:
           % metrics["seed"],
           "- 推理后端: %s(sklearn 缺失时为 numpy-fallback 降级路径)" % backend,
           "- 评估对象: 规则/统计基线(健康评分 + 阶段分类 + RUL 趋势外推), 未训练深度模型",
+          "- RUL 量纲口径: 真值与预测/置信区间统一为小时——本评估逐循环喂入"
+          "(1 条记录 = 1 tick = 10 分钟), 真值经 truth_rul_hours() 换算; "
+          "看板流水线(演示节奏)每 6 个循环仅把最后 1 条喂给引擎, 其在线 RUL "
+          "与本评估存在约 3 倍系统性口径差(已知待统一项, 复审报告 07-P1)",
           "",
           "> **局限声明**: 特征与标签同源于自仿真数据(同一健康度真值同时决定"
           "传感器读数与标签), 以下指标系统性偏高, 仅用于回归对比与缺陷验证,"
@@ -297,12 +328,18 @@ def render_report(metrics: dict, seed: int, csv_path: str, backend: str) -> str:
            "",
            "> 窗口内阶段误判集中在真值健康度 0.75~0.8 区间: 该区间传感器信号"
            "仅约 1σ, 与运行工况噪声同量级, 属特征信息量决定的统计下限。", ""]
+    thr0 = metrics["rul"]["vs_failure_threshold"]
     md += ["RUL 误差解读: 健康度按幂函数先缓后急退化, 线性外推在退化前半程"
-           "系统性高估(凸性偏差), 且相对误差指标以真值 RUL 为分母、晚期样本"
-           "分母极小, 故全周期中位相对误差天然偏高。晚期误差主要来自代理评分"
-           "噪声(故障冲击特征使振动 z 波动达 ±4σ 以上)被浅斜率放大, 属特征"
-           "信息量决定的方法下限; docs §15 已将\"一次趋势外推不处理退化拐点\""
-           "列为已知边界。", ""]
+           "系统性高估(凸性偏差)——v1.2 量纲修正后该早期高估如实体现在平均"
+           "/P90 相对误差与最大高估倍数上(主口径单点最高 %.1f 倍), 不再被 "
+           "tick/小时混用伪装成接近完美; 且相对误差指标以真值 RUL 为分母、"
+           "晚期样本分母极小, 全周期中位相对误差因此天然偏高。晚期误差主要"
+           "来自代理评分噪声(故障冲击特征使振动 z 波动达 ±4σ 以上)被浅斜率"
+           "放大, 属特征信息量决定的方法下限。主口径 80%% CI 实测覆盖率 %s%%, "
+           "仍远低于名义 80%%——残差自相关使独立性假设低估长程不确定性, 叠加"
+           "凸性高估; 该基线适用于趋势参考与回归对比, 不应作为精确检修时刻"
+           "依据; docs §15 已将\"一次趋势外推不处理退化拐点\"列为已知边界。"
+           % (thr0["max_overestimate_ratio"], thr0["ci_coverage_pct"]), ""]
     for title, key in (("主口径: RUL 真值 = 真值健康度首次跌破 0.35(失效阈值"
                         " 35 分的校准等价点)的剩余时长", "vs_failure_threshold"),
                        ("参考口径: RUL 真值 = 至寿命终点(健康度=0)的剩余时长",
@@ -314,6 +351,9 @@ def render_report(metrics: dict, seed: int, csv_path: str, backend: str) -> str:
                "| RUL 中位相对误差 | %s |" % (("%.1f%%" % st["median_rel_err_pct"]) if st["median_rel_err_pct"] is not None else "-"),
                "| RUL 平均相对误差 | %s |" % (("%.1f%%" % st["mean_rel_err_pct"]) if st["mean_rel_err_pct"] is not None else "-"),
                "| RUL P90 相对误差 | %s |" % (("%.1f%%" % st["p90_rel_err_pct"]) if st["p90_rel_err_pct"] is not None else "-"),
+               "| 单点最大高估倍数(预测/真值) | %s |"
+               % (("%.1f" % st["max_overestimate_ratio"])
+                  if st["max_overestimate_ratio"] else "-"),
                "| RUL MAE / 中位绝对误差 | %s / %s 小时 |"
                % (st["mae_hours"] if st["mae_hours"] is not None else "-",
                   st["median_abs_err_hours"] if st["median_abs_err_hours"] is not None else "-"),
@@ -365,6 +405,8 @@ def run_selftest() -> bool:
       1. 点估计接近真值(容差由斜率估计方差决定);
       2. 真值失效时刻落在 80% CI 内(覆盖率性质);
       3. CI 宽度与外推不确定性相称(慢退化宽、快退化相对窄)。
+    另含真值换算契约用例: truth_rul_hours() 必须把 tick 差值换算为小时
+    (v1.0 曾把 tick 差值直接当小时比较, 复审报告 07-N-P0-1)。
     """
     pred = RULPredictor()
     rng = __import__("numpy").random.RandomState(2026)
@@ -397,6 +439,20 @@ def run_selftest() -> bool:
         for k, v in checks.items():
             if not v:
                 print("       未通过: %s" % k)
+    # 真值换算量纲契约: 60 tick × (10 分钟/tick) 必须等于 10 小时,
+    # 且 RULPredictor 点估计与真值同量纲(上例 rel 误差已按小时算)
+    dim_checks = {
+        "tick→小时换算": abs(truth_rul_hours(0, 60) - 10.0) < 1e-9,
+        "负差值截断为0": truth_rul_hours(70, 60) == 0.0,
+        "TICK_HOURS<1h": 0.0 < TICK_HOURS < 1.0,
+    }
+    dim_ok = all(dim_checks.values())
+    ok = ok and dim_ok
+    print("[%s] 真值RUL量纲契约: 60tick=%.1fh(期望10.0h), TICK_HOURS=%.4f"
+          % ("PASS" if dim_ok else "FAIL", truth_rul_hours(0, 60), TICK_HOURS))
+    for k, v in dim_checks.items():
+        if not v:
+            print("       未通过: %s" % k)
     print("\nRUL CI 自检结果: %s" % ("全部通过" if ok else "存在失败"))
     return ok
 
