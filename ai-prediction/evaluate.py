@@ -19,10 +19,12 @@
       真值按 tick 差值 × TICK_HOURS(1 tick = 10 分钟)换算, 唯一换算点在
       truth_rul_hours(); 此前真值滞留 tick 量纲与 rul_hours 直接比较,
       使全部 RUL 定量指标失真(复审报告 07-N-P0-1);
-    - 与在线口径的差异: 本评估逐循环喂入(1 条记录 = 1 tick), 与
-      RULPredictor 的"每条 = 10 分钟"假设一致; 看板流水线为演示节奏,
-      每 6 个模拟循环仅把最后 1 条喂给引擎, 其在线 RUL 与本评估存在
-      约 3 倍的系统性口径差, 属已知待统一项(复审报告 07-P1);
+    - 与在线口径的一致性(v1.3 统一, 复审报告 07-N-P1-1): 本评估逐循环喂入
+      (1 条记录 = 1 tick), 看板流水线自 v1.3 起同样逐循环把每条记录喂给
+      引擎(取消 6:1 节流喂入, 仅展示层与孪生同步取最后一批), 两侧共用
+      RULPredictor 的同一换算——同一轨迹上在线 RUL 与本评估逐位一致,
+      预测预警(72h 窗口)触发时刻与真值 RUL 对齐; --selftest 含该口径的
+      回归断言(逐 tick 口径锁 + 6:1 节流危害用例);
     - 局限声明: 特征与标签同源于自仿真数据(同一健康度决定传感器读数与
       标签), 任何在此数据上的指标都系统性偏高, 不能外推到真实产线精度。
 
@@ -47,7 +49,7 @@ for sub in (HERE, os.path.join(PROJECT_ROOT, "data-ingestion")):
 
 from predictive_engine import (PredictiveEngine, RULPredictor, HealthScorer,  # noqa: E402
                                load_history, DEFAULT_CSV, TICK_HOURS)
-from data_simulator import DataSimulator, DEVICES                             # noqa: E402
+from data_simulator import DataSimulator, DEVICES, SIM_TICK_MINUTES  # noqa: E402
 
 # RUL 真值口径: 失效阈值 35 分在校准评分(≈100×健康度)下对应的真值健康度
 TRUTH_FAILURE_HEALTH = 0.35
@@ -283,8 +285,8 @@ def render_report(metrics: dict, seed: int, csv_path: str, backend: str) -> str:
           "- 评估对象: 规则/统计基线(健康评分 + 阶段分类 + RUL 趋势外推), 未训练深度模型",
           "- RUL 量纲口径: 真值与预测/置信区间统一为小时——本评估逐循环喂入"
           "(1 条记录 = 1 tick = 10 分钟), 真值经 truth_rul_hours() 换算; "
-          "看板流水线(演示节奏)每 6 个循环仅把最后 1 条喂给引擎, 其在线 RUL "
-          "与本评估存在约 3 倍系统性口径差(已知待统一项, 复审报告 07-P1)",
+          "看板流水线自 v1.3 起同样逐循环喂入(复审报告 07-P1 口径统一), "
+          "同一轨迹上在线 RUL 与本评估逐位一致、预测预警触发与真值对齐",
           "",
           "> **局限声明**: 特征与标签同源于自仿真数据(同一健康度真值同时决定"
           "传感器读数与标签), 以下指标系统性偏高, 仅用于回归对比与缺陷验证,"
@@ -397,8 +399,67 @@ def _synth_series(rng, b: float, sigma: float, n: int = 40, y0: float = None):
     return y, true_rul_hours
 
 
+# ------------------------------------------------------------------------------
+# 喂入口径一致性用例(v1.3 统一, 复审报告 07-N-P1-1)
+# ------------------------------------------------------------------------------
+def _synth_linear_exact(b: float, n: int = 200):
+    """无噪声线性退化评分序列(确定性): 每条 = 1 tick, 真值失效时刻解析可得。"""
+    y = [100.0 + b * i for i in range(n)]
+    true_hours = (y[-1] - 35.0) / (-b) * TICK_HOURS
+    return y, true_hours
+
+
+def _synth_convex_exact(n: int, life: int):
+    """幂函数凸性退化评分序列(确定性): score_i = 100×(1-(i/life)^1.6),
+    与数据模拟器 DeviceSimulator.health() 的衰退曲线同族。"""
+    return [100.0 * (1.0 - (i / life) ** 1.6) for i in range(n)]
+
+
+def run_caliber_selftest() -> bool:
+    """喂入口径回归锁(2026-09 第四轮修补, 复审报告 07-N-P1-1)。
+
+    背景: v1.2 及之前看板流水线每 6 个模拟循环只把最后 1 条喂给引擎, 而
+    RULPredictor 按"1 条 = 1 tick"换算, 同一设备状态在线 RUL 与评估口径
+    存在约 3 倍系统性分歧、预测预警提前触发; v1.3 起看板逐循环喂入, 与本
+    评估共用同一换算。两条确定性断言防止口径再漂移:
+      1. 逐 tick 口径锁: 无噪线性序列上 predict() 必须还原解析真值
+         (换算常量/公式漂移会立即失败);
+      2. 6:1 节流危害用例: 同一凸性退化序列, 若按 6:1 抽样喂入而仍用默认
+         "每条 = 1 tick"语义(v1.2 看板行为), 换算差 1/6 与凸性窗口效应
+         (平均斜率被低估)叠加, RUL 系统性失真——实测约为逐 tick 口径的
+         0.25 倍, 预警因此大幅提前触发。断言其偏离逐 tick 口径 10% 以上,
+         锁定"禁止节流喂入"这一设计决定。
+    """
+    pred = RULPredictor()
+    ok = True
+    # 1) 逐 tick 口径锁
+    y, true_hours = _synth_linear_exact(b=-0.02, n=200)
+    r = pred.predict(y)
+    rel = abs(r["rul_hours"] - true_hours) / true_hours
+    lock_ok = rel <= 0.01
+    ok = ok and lock_ok
+    print("[%s] 逐tick口径锁: 线性序列 RUL=%.1fh(解析真值 %.1fh, 偏差 %.3f%%)"
+          % ("PASS" if lock_ok else "FAIL", r["rul_hours"], true_hours, 100.0 * rel))
+    # 2) 6:1 节流危害用例(旧看板行为的反例)
+    y_c = _synth_convex_exact(n=764, life=1320)
+    r_tick = pred.predict(y_c)
+    r_thr = pred.predict(y_c[::6])
+    ratio = r_thr["rul_hours"] / r_tick["rul_hours"]
+    hazard_ok = 0.10 <= ratio <= 0.60
+    ok = ok and hazard_ok
+    print("[%s] 6:1节流危害锁: 逐tick喂入 RUL=%.1fh, 节流喂入 RUL=%.1fh"
+          "(比值 %.2f, 复现 v1.2 的约 1/4 失真, 须偏离逐tick口径 10%% 以上)"
+          % ("PASS" if hazard_ok else "FAIL", r_tick["rul_hours"],
+             r_thr["rul_hours"], ratio))
+    for name, bad in (("逐tick口径锁", not lock_ok),
+                      ("6:1节流危害锁", not hazard_ok)):
+        if bad:
+            print("       未通过: %s" % name)
+    return ok
+
+
 def run_selftest() -> bool:
-    """RUL 置信区间量纲单元用例。
+    """RUL 置信区间量纲单元用例 + 喂入口径一致性回归锁。
 
     慢退化(|b| 小)是 v1.0 量纲错误的重灾区: margin 未除以 |b| 时 CI 被
     系统性压窄, 无法覆盖真值。两用例断言:
@@ -406,7 +467,9 @@ def run_selftest() -> bool:
       2. 真值失效时刻落在 80% CI 内(覆盖率性质);
       3. CI 宽度与外推不确定性相称(慢退化宽、快退化相对窄)。
     另含真值换算契约用例: truth_rul_hours() 必须把 tick 差值换算为小时
-    (v1.0 曾把 tick 差值直接当小时比较, 复审报告 07-N-P0-1)。
+    (v1.0 曾把 tick 差值直接当小时比较, 复审报告 07-N-P0-1), 以及
+    TICK_HOURS 与模拟器 SIM_TICK_MINUTES 的跨模块一致性;
+    run_caliber_selftest() 锁定"逐 tick 喂入"口径(复审报告 07-N-P1-1)。
     """
     pred = RULPredictor()
     rng = __import__("numpy").random.RandomState(2026)
@@ -440,20 +503,26 @@ def run_selftest() -> bool:
             if not v:
                 print("       未通过: %s" % k)
     # 真值换算量纲契约: 60 tick × (10 分钟/tick) 必须等于 10 小时,
-    # 且 RULPredictor 点估计与真值同量纲(上例 rel 误差已按小时算)
+    # 且 RULPredictor 点估计与真值同量纲(上例 rel 误差已按小时算);
+    # TICK_HOURS 须与模拟器的 SIM_TICK_MINUTES 保持跨模块一致(唯一换算源)
     dim_checks = {
         "tick→小时换算": abs(truth_rul_hours(0, 60) - 10.0) < 1e-9,
         "负差值截断为0": truth_rul_hours(70, 60) == 0.0,
         "TICK_HOURS<1h": 0.0 < TICK_HOURS < 1.0,
+        "与SIM_TICK_MINUTES一致": abs(TICK_HOURS - SIM_TICK_MINUTES / 60.0) < 1e-12,
     }
     dim_ok = all(dim_checks.values())
     ok = ok and dim_ok
     print("[%s] 真值RUL量纲契约: 60tick=%.1fh(期望10.0h), TICK_HOURS=%.4f"
-          % ("PASS" if dim_ok else "FAIL", truth_rul_hours(0, 60), TICK_HOURS))
+          "(= SIM_TICK_MINUTES %d/60)"
+          % ("PASS" if dim_ok else "FAIL", truth_rul_hours(0, 60), TICK_HOURS,
+             SIM_TICK_MINUTES))
     for k, v in dim_checks.items():
         if not v:
             print("       未通过: %s" % k)
-    print("\nRUL CI 自检结果: %s" % ("全部通过" if ok else "存在失败"))
+    # 喂入口径一致性回归锁(v1.3 统一, 复审报告 07-N-P1-1)
+    ok = run_caliber_selftest() and ok
+    print("\nRUL CI 与喂入口径自检结果: %s" % ("全部通过" if ok else "存在失败"))
     return ok
 
 

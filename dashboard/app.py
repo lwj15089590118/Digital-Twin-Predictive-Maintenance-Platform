@@ -95,8 +95,10 @@ class Pipeline:
     顺序执行, 逻辑一致且便于观察数据流转。
     """
 
-    # 演示加速: 每个真实秒推进 FAST_FORWARD 个模拟循环,
-    # 使设备在数分钟内走完"健康 -> 故障"完整生命周期
+    # 演示加速: 每 tick_seconds(2.0) 真实秒推进 FAST_FORWARD 个模拟循环,
+    # 使设备在数分钟内走完"健康 -> 故障"完整生命周期。
+    # 注意: 模拟循环与 AI 喂入是两个概念——全部循环逐条喂给预测引擎(口径
+    # 契约见 step()), 节流只体现在"展示层取最后一批"与孪生同步频率上。
     FAST_FORWARD = 6
     tick_seconds = 2.0
 
@@ -133,22 +135,38 @@ class Pipeline:
             self._stop.wait(self.tick_seconds)
 
     def step(self):
-        """推进一轮: 模拟 -> 存流 -> 孪生同步 -> AI 预测 -> 故障归因 -> 告警。"""
-        for _ in range(self.FAST_FORWARD):
+        """推进一轮: 模拟 -> 存流 -> AI 逐条预测/告警 -> 孪生同步 -> 看板展示。
+
+        喂入口径契约(2026-09 第四轮修补, 复审报告 07-N-P1-1):
+        FAST_FORWARD 个模拟循环产生的每一条记录都按"1 条记录 = 1 tick =
+        10 分钟"逐条喂给预测引擎与告警引擎, 与 RULPredictor 的换算假设及
+        evaluate.py 的评估喂入严格一致——看板在线 RUL、预测预警触发时刻与
+        评估工件同口径(同一轨迹实测逐位一致)。v1.2 及之前只把最后一批喂给
+        引擎, 同一设备状态的在线 RUL 与评估口径存在约 3 倍系统性分歧, 且
+        预测预警在真值 RUL 远高于 72h 时即提前触发。
+        数字孪生同步仍取最后一批: 孪生偏差按同步次数累积, 无小时量纲语义,
+        且 update_all 每次调用都会落盘 twin_state.json, 保持演示节奏的同时
+        控制写盘频率。
+        """
+        showcase = []                            # 最后一批(看板展示层取材)
+        for k in range(self.FAST_FORWARD):
             records = self.simulator.step_all()
             self.writer.write(records)                       # 1) 数据落流
+            for rec in records:                              # 2) AI 逐条喂入(口径契约)
+                prediction = self.engine.assess(rec)         #    AI 预测
+                fault = self.classifier.classify(            # 3) 故障归因
+                    prediction["features"],
+                    rec.get("device_type", "motor"),
+                    health_score=prediction["health_score"])
+                fired = self.alerts.evaluate(prediction)     # 4) 告警/工单
+                if fired:
+                    for a in fired:
+                        print("[看板] 告警: %s" % a["title"])
+                if k == self.FAST_FORWARD - 1:
+                    showcase.append((rec, prediction, fault))
         twin_summaries = {s["device_id"]: s
-                          for s in self.twin.update_all(records)}   # 2) 孪生同步
-        for rec in records:
-            prediction = self.engine.assess(rec)             # 3) AI 预测
-            fault = self.classifier.classify(                # 4) 故障归因
-                prediction["features"],
-                rec.get("device_type", "motor"),
-                health_score=prediction["health_score"])
-            fired = self.alerts.evaluate(prediction)         # 5) 告警/工单
-            if fired:
-                for a in fired:
-                    print("[看板] 告警: %s" % a["title"])
+                          for s in self.twin.update_all([r for r, _, _ in showcase])}
+        for rec, prediction, fault in showcase:              # 5) 看板数据仓更新
             store.push(rec, prediction, fault,
                        twin_summaries.get(rec["device_id"], {}))
 

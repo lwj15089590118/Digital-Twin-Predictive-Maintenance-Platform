@@ -57,7 +57,12 @@ FAILURE_THRESHOLD = 35.0
 # 会让线性外推产生无意义的巨额数值; 按行业惯例对 RUL 做上限截断
 # (如 C-MAPSS 基准将 RUL 截断至 125 循环), 超出运维规划视野的预测不再输出
 RUL_MAX_HOURS = 2160.0
-# 每个采样 tick 对应的真实运行时长(小时), 与数据模拟器保持一致
+# 每个采样 tick 对应的真实运行时长(小时), 与数据模拟器保持一致。
+# 喂入口径契约(2026-09 第四轮修补, 复审报告 07-N-P1-1): 所有喂入方(看板
+# 流水线 / evaluate.py 评估 / 演示)必须把模拟产生的每一条记录逐条喂给引擎,
+# 即 1 条记录 = 1 tick = TICK_HOURS 小时——若按 6:1 等节流喂入而仍用本常量
+# 换算, 在线 RUL 会与物理时间产生数倍系统性分歧(该 bug 曾使看板 RUL 与
+# 评估口径相差约 3 倍、预测预警提前触发)
 TICK_HOURS = 10.0 / 60.0
 # 参与 RUL 拟合的近期窗口大小(条)。取 144 = 一整天(温度日周期正弦的
 # 完整周期, 见 data_simulator.py 环境波动项): 窗口覆盖完整周期后, 日周期
@@ -269,6 +274,10 @@ class RULPredictor:
 
     def predict(self, health_series: list) -> dict:
         """对健康评分序列(按时间升序, 0~100)预测 RUL。
+
+        输入契约: 序列必须按"1 条 = 1 tick(10 分钟)"等间隔采样——调用方
+        (看板流水线 / 评估脚本)均逐 tick 喂入, 见模块 TICK_HOURS 处的
+        喂入口径契约说明。
 
         Returns:
             {rul_hours, rul_ci_low, rul_ci_high, decline_per_day, trend, method}
