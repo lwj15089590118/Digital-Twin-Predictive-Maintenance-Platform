@@ -73,7 +73,7 @@ class AlertEngine:
         self.alerts = []          # 活动告警列表
         self.workorders = []      # 工单列表
         self._counter = 0
-        # 跨线程互斥锁(2026-08 修复审查报告 07-P1-4): 流水线线程调用
+        # 跨线程互斥锁: 流水线线程调用
         # evaluate(), Flask 线程并发调用 close_workorder()/查询接口/
         # 复位路径, 无锁时 json.dump 遍历列表期间被并发 append 会抛
         # RuntimeError 或写出交错文件。用 RLock 允许 evaluate() 持锁

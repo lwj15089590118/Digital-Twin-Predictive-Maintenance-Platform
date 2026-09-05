@@ -137,7 +137,7 @@ class Pipeline:
     def step(self):
         """推进一轮: 模拟 -> 存流 -> AI 逐条预测/告警 -> 孪生同步 -> 看板展示。
 
-        喂入口径契约(2026-09 第四轮修补, 复审报告 07-N-P1-1):
+        喂入口径契约(v1.3 统一):
         FAST_FORWARD 个模拟循环产生的每一条记录都按"1 条记录 = 1 tick =
         10 分钟"逐条喂给预测引擎与告警引擎, 与 RULPredictor 的换算假设及
         evaluate.py 的评估喂入严格一致——看板在线 RUL、预测预警触发时刻与
@@ -183,7 +183,7 @@ class Pipeline:
             store.twin_summary.clear()
             store.pipeline_ticks = 0
         # 告警复位走 AlertEngine.resolve_all(): 持锁改状态并落盘,
-        # 避免与流水线线程的 evaluate() 竞态(审查报告 07-P1-4)
+        # 避免与流水线线程的 evaluate() 竞态(互斥锁保护)
         self.alerts.resolve_all()
         print("[看板] 演示已复位为全新设备。")
 
