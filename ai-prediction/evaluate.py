@@ -18,8 +18,8 @@
     - RUL 量纲契约(v1.2 修正): 真值 RUL 与预测 RUL/置信区间统一为小时——
       真值按 tick 差值 × TICK_HOURS(1 tick = 10 分钟)换算, 唯一换算点在
       truth_rul_hours(); 此前真值滞留 tick 量纲与 rul_hours 直接比较,
-      使全部 RUL 定量指标失真(复审报告 07-N-P0-1);
-    - 与在线口径的一致性(v1.3 统一, 复审报告 07-N-P1-1): 本评估逐循环喂入
+      使全部 RUL 定量指标失真(v1.1 及之前版本缺陷);
+    - 与在线口径的一致性(v1.3 统一): 本评估逐循环喂入
       (1 条记录 = 1 tick), 看板流水线自 v1.3 起同样逐循环把每条记录喂给
       引擎(取消 6:1 节流喂入, 仅展示层与孪生同步取最后一批), 两侧共用
       RULPredictor 的同一换算——同一轨迹上在线 RUL 与本评估逐位一致,
@@ -66,7 +66,7 @@ def truth_rul_hours(cycle: float, end_cycle: float) -> float:
     小时换算点, 保证与 RULPredictor 输出的 rul_hours / rul_ci_low /
     rul_ci_high(小时)同量纲直接比较; --selftest 含该契约的单元断言。
     v1.0 曾把 tick 差值直接当小时与 rul_hours 比较, 全部 RUL 指标失真
-    (复审报告 07-N-P0-1)。
+    。
     """
     return max(0.0, float(end_cycle) - float(cycle)) * TICK_HOURS
 
@@ -115,7 +115,7 @@ def run_trajectories(seed: int, csv_path: str) -> tuple:
             })
     # 真值 RUL(至失效阈值)需在轨迹结束后回填: 失效循环在时序推进中才确定,
     # 早期样本创建时无法预知(流式语义下的经典陷阱); 回填时经 truth_rul_hours
-    # 统一换算为小时(复审报告 07-N-P0-1 的量纲修正点)
+    # 统一换算为小时(v1.2 量纲修正点)
     for s in samples:
         did = s["device_id"]
         s["truth_rul_thr"] = (truth_rul_hours(s["cycle"], fail_cycle[did])
@@ -285,7 +285,7 @@ def render_report(metrics: dict, seed: int, csv_path: str, backend: str) -> str:
           "- 评估对象: 规则/统计基线(健康评分 + 阶段分类 + RUL 趋势外推), 未训练深度模型",
           "- RUL 量纲口径: 真值与预测/置信区间统一为小时——本评估逐循环喂入"
           "(1 条记录 = 1 tick = 10 分钟), 真值经 truth_rul_hours() 换算; "
-          "看板流水线自 v1.3 起同样逐循环喂入(复审报告 07-P1 口径统一), "
+          "看板流水线自 v1.3 起同样逐循环喂入(与评估口径统一), "
           "同一轨迹上在线 RUL 与本评估逐位一致、预测预警触发与真值对齐",
           "",
           "> **局限声明**: 特征与标签同源于自仿真数据(同一健康度真值同时决定"
@@ -400,7 +400,7 @@ def _synth_series(rng, b: float, sigma: float, n: int = 40, y0: float = None):
 
 
 # ------------------------------------------------------------------------------
-# 喂入口径一致性用例(v1.3 统一, 复审报告 07-N-P1-1)
+# 喂入口径一致性用例(v1.3 统一)
 # ------------------------------------------------------------------------------
 def _synth_linear_exact(b: float, n: int = 200):
     """无噪声线性退化评分序列(确定性): 每条 = 1 tick, 真值失效时刻解析可得。"""
@@ -416,7 +416,7 @@ def _synth_convex_exact(n: int, life: int):
 
 
 def run_caliber_selftest() -> bool:
-    """喂入口径回归锁(2026-09 第四轮修补, 复审报告 07-N-P1-1)。
+    """喂入口径回归锁(v1.3)。
 
     背景: v1.2 及之前看板流水线每 6 个模拟循环只把最后 1 条喂给引擎, 而
     RULPredictor 按"1 条 = 1 tick"换算, 同一设备状态在线 RUL 与评估口径
@@ -467,9 +467,9 @@ def run_selftest() -> bool:
       2. 真值失效时刻落在 80% CI 内(覆盖率性质);
       3. CI 宽度与外推不确定性相称(慢退化宽、快退化相对窄)。
     另含真值换算契约用例: truth_rul_hours() 必须把 tick 差值换算为小时
-    (v1.0 曾把 tick 差值直接当小时比较, 复审报告 07-N-P0-1), 以及
+    (v1.0 曾把 tick 差值直接当小时比较), 以及
     TICK_HOURS 与模拟器 SIM_TICK_MINUTES 的跨模块一致性;
-    run_caliber_selftest() 锁定"逐 tick 喂入"口径(复审报告 07-N-P1-1)。
+    run_caliber_selftest() 锁定"逐 tick 喂入"口径。
     """
     pred = RULPredictor()
     rng = __import__("numpy").random.RandomState(2026)
@@ -520,7 +520,7 @@ def run_selftest() -> bool:
     for k, v in dim_checks.items():
         if not v:
             print("       未通过: %s" % k)
-    # 喂入口径一致性回归锁(v1.3 统一, 复审报告 07-N-P1-1)
+    # 喂入口径一致性回归锁(v1.3 统一)
     ok = run_caliber_selftest() and ok
     print("\nRUL CI 与喂入口径自检结果: %s" % ("全部通过" if ok else "存在失败"))
     return ok
